@@ -46,7 +46,7 @@ build:
       
   # commands run after the environment is setup
   run:
-    - pip3 install xformers torchaudio>=2.0.0
+    - pip3 install torch==2.0.1 xformers torchaudio>=2.0.0 transformers>=4.31.0
     - "pip3 install natten -f https://shi-labs.com/natten/wheels/cu117/torch2.0.0/index.html"
     # - "apt-get update && apt-get install -y ffmpeg"
     # - "apt-get install unzip"
