@@ -163,6 +163,10 @@ class Predictor(BasePredictor):
             description="Seed for random number generator. If `None` or `-1`, a random seed will be used.",
             default=None,
         ),
+        bpm: int = Input(
+            description="BPM of the input audio. If `None` or `-1`, the BPM will be estimated.",
+            default=-1,
+        ),
         # overlap: int = Input(
         #     description="The length of overlapping part. Last `overlap` seconds of previous generation output audio is given to the next generation's audio prompt for continuation. (This will be fixed with the optimal value and be hidden, when releasing.)",
         #     default=5, le=15, ge=1
@@ -218,14 +222,18 @@ class Predictor(BasePredictor):
         set_all_seeds(seed)
         print(f"Using seed {seed}")
 
-        # Music Structure Analysis
-        music_input_analysis = allin1.analyze(music_input)
-
         music_input, sr = torchaudio.load(music_input)
 
-        print("BPM : ", music_input_analysis.bpm)
+        use_bpm = bpm
+        if bpm == -1:
+            # Music Structure Analysis
+            music_input_analysis = allin1.analyze(music_input)
+
+            print("BPM : ", music_input_analysis.bpm)
+
+            use_bpm = music_input_analysis.bpm
         
-        prompt = prompt + f', bpm : {int(music_input_analysis.bpm)}'
+        prompt = prompt + f', bpm : {int(use_bpm)}'
         
         music_input = music_input[None] if music_input.dim() == 2 else music_input
         duration = music_input.shape[-1]/sr
@@ -249,6 +257,15 @@ class Predictor(BasePredictor):
             wav, tokens = model.generate_with_chroma([prompt], music_input, sr, progress=True, return_tokens=True)
             if multi_band_diffusion:
                 wav = self.mbd.tokens_to_wav(tokens)
+        mask_nan = torch.isnan(wav)
+        mask_inf = torch.isinf(wav)
+
+        wav[mask_nan] = 0  
+        wav[mask_inf] = 1
+
+        wav_amp = wav.abs().max()
+        wav = (wav/wav_amp).cpu()
+        # print(wav.abs().max())
         audio_write(
                 "background",
                 wav[0].cpu(),
@@ -257,46 +274,66 @@ class Predictor(BasePredictor):
         )
 
         wav_length = wav.shape[-1]
-        wav_analysis = allin1.analyze('background.wav')
 
-        wav_downbeats = []
-        input_downbeats = []
-        for wav_beat in wav_analysis.downbeats:
-            input_beat = min(music_input_analysis.downbeats, key=lambda x: abs(wav_beat - x), default=None)
-            if input_beat is None:
-                continue
-            print(wav_beat, input_beat)
-            if len(input_downbeats) != 0 and int(input_beat * wav_sr) == input_downbeats[-1]:
-                print('Dropped')
-                continue
-            if abs(wav_beat-input_beat)>beat_sync_threshold:
-                input_beat = wav_beat
-                print('Replaced')
-            wav_downbeats.append(int(wav_beat * wav_sr))
-            input_downbeats.append(int(input_beat * wav_sr))
+        if bpm == -1:
+            wav_analysis = allin1.analyze('background.wav')
 
-        downbeat_offset = input_downbeats[0]-wav_downbeats[0]
-        if downbeat_offset > 0:
-            wav = torch.concat([torch.zeros([1,1,int(downbeat_offset*wav_sr)]).cpu(),wav.cpu()],dim=-1)
-            for i in range(len(wav_downbeats)):
-                wav_downbeats[i]=wav_downbeats[i]+downbeat_offset
-        wav_downbeats = [0] + wav_downbeats + [wav_length]
-        input_downbeats = [0] + input_downbeats + [wav_length]
+            wav_downbeats = []
+            input_downbeats = []
+            for wav_beat in wav_analysis.downbeats:
+                input_beat = min(music_input_analysis.downbeats, key=lambda x: abs(wav_beat - x), default=None)
+                if input_beat is None:
+                    continue
+                print(wav_beat, input_beat)
+                if len(input_downbeats) != 0 and int(input_beat * wav_sr) == input_downbeats[-1]:
+                    print('Dropped')
+                    continue
+                if abs(wav_beat-input_beat)>beat_sync_threshold:
+                    input_beat = wav_beat
+                    print('Replaced')
+                wav_downbeats.append(int(wav_beat * wav_sr))
+                input_downbeats.append(int(input_beat * wav_sr))
 
-        wav = torch.Tensor(tsm.wsola(wav[0].cpu().detach().numpy(), np.array([wav_downbeats, input_downbeats])))[...,:wav_length].unsqueeze(0).to(torch.float32)
+            downbeat_offset = input_downbeats[0]-wav_downbeats[0]
+            if downbeat_offset > 0:
+                wav = torch.concat([torch.zeros([1,1,int(downbeat_offset)]).cpu(),wav.cpu()],dim=-1)
+                for i in range(len(wav_downbeats)):
+                    wav_downbeats[i]=wav_downbeats[i]+downbeat_offset
+            wav_downbeats = [0] + wav_downbeats + [wav_length]
+            input_downbeats = [0] + input_downbeats + [wav_length]
 
-        audio_write(
-            "background_synced",
-            wav[0].cpu(),
-            model.sample_rate,
-            strategy=normalization_strategy,
-            loudness_compressor=True,
-        )
+            wav = torch.Tensor(tsm.wsola(wav[0].cpu().detach().numpy(), np.array([wav_downbeats, input_downbeats])))[...,:wav_length].unsqueeze(0).to(torch.float32)
 
-        wav_amp = torch.max(torch.abs(wav))
+        mask_nan = torch.isnan(wav)
+        mask_inf = torch.isinf(wav)
+        wav[mask_nan] = 0
+        wav[mask_inf] = 1
+
+        wav_amp = wav.abs().max()
+        if wav_amp != 0:
+            wav = (wav/wav_amp).cpu()
+        # audio_write(
+        #     "background_synced",
+        #     wav[0].cpu(),
+        #     model.sample_rate,
+        #     strategy=normalization_strategy,
+        #     loudness_compressor=True,
+        # )
+
+        # wav_amp = torch.max(torch.abs(wav))
         # vocal_amp = torch.max(torch.abs(vocal))
-        # wav = 0.5*(wav/wav_amp).cpu() + 0.5*(vocal/vocal_amp)[...,:wav_length].cpu()*0.5
-        wav = (wav/wav_amp).cpu()
+        wav_amp = wav.abs().max()
+        wav = (wav/wav_amp).cpu() 
+        
+        mask_nan = torch.isnan(wav)
+        mask_inf = torch.isinf(wav)
+
+        wav[mask_nan] = 0  
+        wav[mask_inf] = 1
+
+        wav_amp = wav.abs().max()
+        if wav_amp != 0:
+            wav = (wav/wav_amp).cpu()
         
         audio_write(
             "out",
